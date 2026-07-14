@@ -6,9 +6,14 @@ Repository for IPM-related work.
 
 ### Process
 
-The MSU-MFSD data processing instructions live in [DATA_process/README.md](DATA_process/README.md).
+The dataset processing instructions live in [DATA_process/README.md](DATA_process/README.md).
 
-Use that guide for the full folder layout, requirements, output structure, and run commands for `process_msu_3ddfa.py`.
+Use that guide for the full folder layout, requirements, output structure, and run commands for the supported datasets:
+
+- `process_msu_3ddfa.py` for MSU-MFSD
+- `process_oulu_3ddfa.py` for OULU-NPU
+
+To run the processing scripts, clone [cleardusk/3DDFA_V2](https://github.com/cleardusk/3DDFA_V2) and place it next to the raw dataset folder at the same level as the data source directory. The scripts import 3DDFA components directly to generate the depth maps.
 
 ### Sources
 
@@ -37,11 +42,3 @@ In order to get the OULU-NPU dataset, please do the following:
 5. Download the database using the link provided after the request is processed.
 
 Use the official OULU-NPU publication citation from the dataset page when referencing this database in your work.
-
-#### Face Anti-spoofing Challenge - CASIA-SURF CeFA@CVPR2020
-
-[Face Anti-spoofing Challenge - CASIA-SURF CeFA@CVPR2020](https://sites.google.com/view/face-anti-spoofing-challenge/dataset-download/casia-surf-cefacvpr2020)
-
-You will be required to first sign [a licensing agreement](http://www.cbsr.ia.ac.cn/users/jwan/database/CeFA_agreement.pdf) and send it to [Jun Wan](http://www.cbsr.ia.ac.cn/users/jwan/research.html) at [jun.wan@ia.ac.cn](mailto:jun.wan@ia.ac.cn).
-
-If you tend to get the commercial license of this dataset, please email [contact@surfingtech.cn](mailto:contact@surfingtech.cn).
