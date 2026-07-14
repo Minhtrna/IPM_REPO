@@ -59,9 +59,16 @@ def make_masked_rgb_and_depth(img_bgr, tddfa, box):
     depth_map = rasterize(ver, tddfa.tri, z_norm, bg=overlap)
     
     mask = depth_map[:, :, 0] > 0
-    mask_uint8 = mask.astype(np.uint8)
+    mask_uint8 = mask.astype(np.uint8) * 255
+    
+    contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    solid_mask = np.zeros_like(mask_uint8)
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+        cv2.drawContours(solid_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+    
     masked_bgr = img_bgr.copy()
-    masked_bgr[mask_uint8 == 0] = 0
+    masked_bgr[solid_mask == 0] = 0
 
     x_min, x_max = np.min(ver_lst[0][0, :]), np.max(ver_lst[0][0, :])
     y_min, y_max = np.min(ver_lst[0][1, :]), np.max(ver_lst[0][1, :])

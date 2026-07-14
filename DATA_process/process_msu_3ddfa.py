@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import re
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -15,9 +16,29 @@ MSU_DIR    = SCRIPT_DIR / 'MSU-MFSD' / 'MSU-MFSD-Publish.zip'
 OUTPUT_DIR = SCRIPT_DIR / 'MSU-MFSD' / 'processed_3ddfa'
 TDDFA_DIR  = SCRIPT_DIR / '3DDFA_V2'
 
+TRAIN_LIST = MSU_DIR / 'train_sub_list.txt'
+TEST_LIST  = MSU_DIR / 'test_sub_list.txt'
+
+CLIENT_ID_RE = re.compile(r"client(\d{3})")
+
 OUTPUT_SIZE = 256
 
 sys.path.insert(0, str(TDDFA_DIR))
+
+def get_client_id(filename: str) -> int:
+    m = CLIENT_ID_RE.search(filename)
+    if not m:
+        return -1
+    return int(m.group(1))
+
+def load_subject_list(filepath: Path) -> set:
+    ids = set()
+    with open(filepath, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                ids.add(int(line))
+    return ids
 
 def init_tddfa():
     cwd = os.getcwd()
@@ -31,11 +52,18 @@ def init_tddfa():
     finally:
         os.chdir(cwd)
 
-def make_masked_rgb_and_depth(img_bgr, tddfa, box):
+def make_masked_rgb_and_depth(img_bgr, tddfa, face_entry):
     from Sim3DR import rasterize
     from utils.tddfa_util import _to_ctype
+    
+    left = face_entry['left']
+    top = face_entry['top']
+    right = face_entry['right']
+    bottom = face_entry['bottom']
+    
+    tight_box = [left, top, right, bottom, 1.0]
+    boxes = [tight_box]
 
-    boxes = [box]
     with torch.no_grad():
         param_lst, roi_box_lst = tddfa(img_bgr, boxes)
     if not param_lst: return None, None
@@ -52,21 +80,32 @@ def make_masked_rgb_and_depth(img_bgr, tddfa, box):
     overlap = np.zeros_like(img_bgr, dtype=np.uint8)
     depth_map = rasterize(ver, tddfa.tri, z_norm, bg=overlap)
 
+    # Solid masking using contours to fill holes (like mouth)
     mask = depth_map[:, :, 0] > 0
-    mask_uint8 = mask.astype(np.uint8)
-    masked_bgr = img_bgr.copy()
-    masked_bgr[mask_uint8 == 0] = 0
-
-    x_min, x_max = np.min(ver_lst[0][0, :]), np.max(ver_lst[0][0, :])
-    y_min, y_max = np.min(ver_lst[0][1, :]), np.max(ver_lst[0][1, :])
-    h, w = img_bgr.shape[:2]
-    x_min, y_min = max(0, int(x_min)), max(0, int(y_min))
-    x_max, y_max = min(w, int(x_max)), min(h, int(y_max))
+    mask_uint8 = mask.astype(np.uint8) * 255
     
-    margin_w = int((x_max - x_min) * 0.05)
-    margin_h = int((y_max - y_min) * 0.05)
-    x1, y1 = max(0, x_min - margin_w), max(0, y_min - margin_h)
-    x2, y2 = min(w, x_max + margin_w), min(h, y_max + margin_h)
+    contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    solid_mask = np.zeros_like(mask_uint8)
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+        cv2.drawContours(solid_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+    
+    masked_bgr = img_bgr.copy()
+    masked_bgr[solid_mask == 0] = 0
+
+    h, w = img_bgr.shape[:2]
+    
+    box_w = right - left
+    box_h = bottom - top
+    
+    margin = 0.2
+    m_x = int(box_w * margin)
+    m_y = int(box_h * margin)
+    
+    x1 = max(0, left - m_x)
+    y1 = max(0, top - m_y)
+    x2 = min(w, right + m_x)
+    y2 = min(h, bottom + m_y)
 
     return masked_bgr[y1:y2, x1:x2], depth_map[y1:y2, x1:x2]
 
@@ -81,15 +120,21 @@ def get_label_from_filename(stem):
 def parse_msu_face_file(face_path):
     entries = []
     with open(face_path, 'r') as f:
-        for idx, line in enumerate(f):
+        for line in f:
             parts = [p.strip() for p in line.strip().split(',')]
             if len(parts) >= 5:
-                x, y, w, h = map(int, parts[1:5])
-                if w == 0 or h == 0: continue
-                margin_x, margin_y = int(w * 0.3), int(h * 0.3)
-                x1, y1 = max(0, x - margin_x), max(0, y - margin_y)
-                x2, y2 = x + w + margin_x, y + h + margin_y
-                entries.append({'frame_idx': idx, 'box': [x1, y1, x2, y2, 1.0]})
+                frame_idx = int(parts[0])
+                left, top, right, bottom = map(int, parts[1:5])
+                w, h = right - left, bottom - top
+                if w <= 0 or h <= 0: continue
+                
+                entries.append({
+                    'frame_idx': frame_idx,
+                    'left': left,
+                    'top': top,
+                    'right': right,
+                    'bottom': bottom
+                })
     return entries
 
 def sample_frames(entries, n):
@@ -98,8 +143,12 @@ def sample_frames(entries, n):
     return [entries[i] for i in idx]
 
 def build_tasks(split_name, frames_per_video):
-    subdirs = ['scene01'] if split_name == 'all' else [split_name]
+    subdirs = ['scene01']
     tasks = []
+    
+    train_ids = load_subject_list(TRAIN_LIST)
+    test_ids  = load_subject_list(TEST_LIST)
+    
     for sdir in subdirs:
         scene_dir = MSU_DIR / sdir
         if not scene_dir.exists(): continue
@@ -109,7 +158,19 @@ def build_tasks(split_name, frames_per_video):
             for video_path in sorted(list(ldir.glob('*.mp4')) + list(ldir.glob('*.mov'))):
                 face_path = video_path.with_suffix('.face')
                 if not face_path.exists(): continue
-                out_dir = OUTPUT_DIR / sdir / label_dir / video_path.stem
+                
+                cid = get_client_id(video_path.name)
+                if cid in train_ids:
+                    vid_split = "train"
+                elif cid in test_ids:
+                    vid_split = "test"
+                else:
+                    continue
+                
+                if split_name != 'all' and split_name != vid_split:
+                    continue
+                    
+                out_dir = OUTPUT_DIR / vid_split / label_dir / video_path.stem
                 entries = parse_msu_face_file(face_path)
                 if not entries: continue
                 tasks.append({'video': video_path, 'label': label_dir, 'out_dir': out_dir, 'entries': entries, 'frames_per_video': frames_per_video})
@@ -150,19 +211,37 @@ def process_video(task, tddfa):
             if remaining_indices: queue.append(remaining_indices.pop())
             continue
 
-        box = entry['box']
         if is_real:
-            cropped_bgr, cropped_depth = make_masked_rgb_and_depth(frame, tddfa, box)
+            cropped_bgr, cropped_depth = make_masked_rgb_and_depth(frame, tddfa, entry)
             if cropped_bgr is None:
-                x1, y1, x2, y2 = map(int, box[:4])
-                cropped_bgr = frame[max(0, y1):y2, max(0, x1):x2]
-                if cropped_bgr.size != 0: cropped_depth = np.zeros(cropped_bgr.shape[:2], dtype=np.uint8)
-            else: ok_depth += 1
+                # fallback crop
+                left, top, right, bottom = entry['left'], entry['top'], entry['right'], entry['bottom']
+                box_w, box_h = right - left, bottom - top
+                margin = 0.2
+                m_x, m_y = int(box_w * margin), int(box_h * margin)
+                x1 = max(0, left - m_x)
+                y1 = max(0, top - m_y)
+                x2 = min(frame.shape[1], right + m_x)
+                y2 = min(frame.shape[0], bottom + m_y)
+                cropped_bgr = frame[y1:y2, x1:x2]
+                
+                if cropped_bgr.size != 0:
+                    cropped_depth = np.zeros(cropped_bgr.shape[:2], dtype=np.uint8)
+            else:
+                ok_depth += 1
         else:
-            cropped_bgr, _ = make_masked_rgb_and_depth(frame, tddfa, box)
+            cropped_bgr, _ = make_masked_rgb_and_depth(frame, tddfa, entry)
             if cropped_bgr is None:
-                x1, y1, x2, y2 = map(int, box[:4])
-                cropped_bgr = frame[max(0, y1):y2, max(0, x1):x2]
+                left, top, right, bottom = entry['left'], entry['top'], entry['right'], entry['bottom']
+                box_w, box_h = right - left, bottom - top
+                margin = 0.2
+                m_x, m_y = int(box_w * margin), int(box_h * margin)
+                x1 = max(0, left - m_x)
+                y1 = max(0, top - m_y)
+                x2 = min(frame.shape[1], right + m_x)
+                y2 = min(frame.shape[0], bottom + m_y)
+                cropped_bgr = frame[y1:y2, x1:x2]
+            
             if cropped_bgr is not None and cropped_bgr.size != 0:
                 cropped_depth = np.zeros(cropped_bgr.shape[:2], dtype=np.uint8)
 
