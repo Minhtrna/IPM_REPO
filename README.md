@@ -13,7 +13,7 @@ Use that guide for the full folder layout, requirements, output structure, and r
 - `process_msu_3ddfa.py` for MSU-MFSD
 - `process_oulu_3ddfa.py` for OULU-NPU
 
-To run the processing scripts, clone [cleardusk/3DDFA_V2](https://github.com/cleardusk/3DDFA_V2) and place it next to the raw dataset folder at the same level as the data source directory. The scripts import 3DDFA components directly to generate the depth maps.
+To run the processing scripts, clone [cleardusk/3DDFA_V2](https://github.com/cleardusk/3DDFA_V2) and place it next to the raw dataset folder at the same level as the data source directory. The scripts import 3DDFA components directly to generate the depth maps. Previous work mainly use PRnet but due to the outdated and hard to setup old tensorflow please follow the new pipeline with 3DDFA V2 instead.
 
 ### Sources
 
