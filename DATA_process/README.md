@@ -1,85 +1,121 @@
-# 3DDFA Face Cropping & Depth Generation Pipeline
+# 3DDFA_V2 Face & Depth Map Extraction Pipeline
 
-This repository contains the data processing pipeline for generating tightly cropped RGB face images and corresponding 3DDFA-aligned depth maps (Z-buffers) for Face Anti-Spoofing datasets.
+This repository contains highly optimized Python scripts designed to extract cropped facial RGB images and generate corresponding 3D depth maps for two major Facial Anti-Spoofing (FAS) datasets: **OULU-NPU** and **MSU-MFSD**.
 
-Currently supported datasets:
-- **MSU-MFSD**
-- **OULU-NPU**
+The pipeline utilizes the **3DDFA_V2** framework (with C++ Cython acceleration) to reconstruct 3D faces from 2D frames, accurately rendering pixel-level depth maps.
 
-## 1. Directory Structure
-For the scripts to work seamlessly, ensure your workspace is structured as follows:
+---
+
+## 1. Expected Directory Structure
+
+When migrating this project to a new machine, ensure your workspace is organized as follows. Replace `<YOUR_WORKSPACE_PATH>` with your actual directory path:
 
 ```text
-d:\DATASET\
+<YOUR_WORKSPACE_PATH>/
 │
-├── 3DDFA_V2/                  # Cloned from https://github.com/cleardusk/3DDFA_V2
-│   ├── FaceBoxes/             # FaceBoxes submodule (must be built via sh ./build.sh)
-│   ├── configs/               # Configurations (e.g. mb1_120x120.yml)
-│   ├── weights/               # Pre-trained models (.pth)
-│   └── ...                    # Other 3DDFA files
+├── process_oulu_3ddfa.py    # Processing script for OULU-NPU
+├── process_msu_3ddfa.py     # Processing script for MSU-MFSD
 │
-├── MSU-MFSD/                  # Original MSU-MFSD Dataset
-│   ├── scene01/
-│   │   ├── real/
-│   │   │   ├── *.mp4          # Video files
-│   │   │   └── *.mp4.face     # MSU bounding box annotation files
-│   │   └── attack/
+├── 3DDFA_V2/                # Cloned 3DDFA_V2 repository
+│   ├── FaceBoxes/
+│   ├── Sim3DR/
 │   └── ...
 │
-├── OULU_NPU/                  # Original OULU-NPU Dataset
-│   ├── Train_files/           
-│   │   ├── Train_files/       # Raw avi and txt files
-│   │   │   ├── *.avi
-│   │   │   └── *.txt          # OULU annotation (eye coordinates)
+├── OULU_NPU/                # Original OULU dataset
+│   ├── Train_files/
 │   ├── Dev_files/
-│   └── Test_files/
+│   ├── Test_files/
+│   └── processed_3ddfa/     # Auto-generated Output directory
 │
-├── process_msu_3ddfa.py       # Processing script for MSU-MFSD
-└── process_oulu_3ddfa.py      # Processing script for OULU-NPU
+└── MSU-MFSD/                # Original MSU dataset
+    ├── MSU-MFSD-Publish.zip/ # (Extracted MSU directory structure)
+    │   └── scene01/
+    └── processed_3ddfa/     # Auto-generated Output directory
 ```
 
-## 2. Setting Up 3DDFA_V2
-The scripts heavily depend on [3DDFA_V2](https://github.com/cleardusk/3DDFA_V2) for dense 3D facial geometry alignment and mask extraction.
+---
 
-1. **Clone the repository:** Clone `3DDFA_V2` directly into your `DATASET` folder.
-   ```bash
-   cd d:\DATASET
-   git clone https://github.com/cleardusk/3DDFA_V2.git
-   cd 3DDFA_V2
-   ```
-2. **Build internal components:** Refer to the official 3DDFA_V2 documentation to compile FaceBoxes and Sim3DR (usually via `sh ./build.sh`).
-3. **Environment:** Ensure your python environment has `torch`, `torchvision`, `cv2` (opencv-python), `numpy`, `scipy`, `tqdm`, and `yaml`.
+## 2. Installation & Setup
+
+When deploying to a new Windows machine, please follow these steps to prepare your environment and compile the C++ extensions.
+
+### Step 1: Prerequisites
+1. Install **Anaconda** or **Miniconda**.
+2. Install **Visual Studio C++ Build Tools** (Required for compiling C++ on Windows). Open the Visual Studio Installer and select the "Desktop development with C++" workload.
+
+### Step 2: Create Conda Environment
+Open Anaconda Prompt (or Terminal) and run:
+```bash
+cd <YOUR_WORKSPACE_PATH>
+conda create -n Project python=3.12 -y
+conda activate Project
+pip install torch torchvision numpy opencv-python pyyaml tqdm cython
+```
+
+### Step 3: Build C++ Cython Modules
+Since compiled `.pyd` files (like `cpu_nms.cp312-win_amd64.pyd`) are tightly bound to the CPU architecture and the exact Python version, you must compile them on the new machine. It is strongly recommended to **delete any old `.pyd` and `.so` files** in the repository before building.
+
+1. **Build FaceBoxes (NMS):**
+```bash
+cd <YOUR_WORKSPACE_PATH>\3DDFA_V2\FaceBoxes\utils
+python build.py build_ext --inplace
+```
+*(Note: Linux flags like `-Wno-cpp` have already been removed from `build.py` to ensure MSVC compatibility).*
+
+2. **Build Sim3DR:**
+```bash
+cd <YOUR_WORKSPACE_PATH>\3DDFA_V2\Sim3DR
+python setup.py build_ext --inplace
+```
+*(Similarly, the `-std=c++11` flag has been removed from `setup.py`).*
+
+---
 
 ## 3. Usage Instructions
 
-The scripts are designed to be run directly from the `DATASET` root directory. The pipeline will automatically navigate into the 3DDFA directory internally.
+Return to the root directory before running the processing scripts.
 
-### Processing MSU-MFSD
-Extracts tightly cropped frames and depth maps for the entire MSU-MFSD dataset.
+### Process OULU-NPU
 ```bash
+cd <YOUR_WORKSPACE_PATH>
 conda activate Project
-cd d:\DATASET
 
-# Run on all subdirectories
-python process_msu_3ddfa.py --split all --frames-per-video 25
-```
-**Output:** Results are saved to `d:\DATASET\MSU-MFSD\processed_3ddfa\`.
-
-### Processing OULU-NPU
-Extracts frames and depth maps for the OULU-NPU dataset. **Note:** OULU annotations use eye coordinates; this script automatically interpolates them into a robust bounding box before applying the 3DDFA mask.
-```bash
-conda activate Project
-cd d:\DATASET
-
-# Run on the whole dataset (Train, Dev, Test)
+# Run the full pipeline (Train, Dev, Test), extracting 25 frames per video
 python process_oulu_3ddfa.py --split all --frames-per-video 25
 
-# Or run on a specific split
-python process_oulu_3ddfa.py --split Train_files --frames-per-video 25
-```
-**Output:** Results are saved to `d:\DATASET\OULU_NPU\processed_3ddfa\`. The script automatically separates attacks into specific directories (`print1`, `print2`, `replay1`, `replay2`) based on the OULU-NPU `file_id` format to strictly support protocol cross-evaluations.
+# Process a specific subset only
+python process_oulu_3ddfa.py --split Train_files
 
-## 4. Key Features
-- **Intelligent Resumption:** If execution is interrupted (e.g. `Ctrl+C`), the scripts will automatically skip fully processed videos upon restart.
-- **Pure OpenCV Pipeline:** Video decoding relies purely on `cv2.VideoCapture` combined with direct frame-seek (`CAP_PROP_POS_FRAMES`), avoiding slow FFMPEG shell executions and temporary images.
-- **Unified Format:** Outputs consistently masked $256 \times 256$ RGB frames and corresponding 8-bit depth maps with a black background (`0`), perfectly aligned to the facial geometry.
+# Dry-run (lists total tasks without actually processing/saving images)
+python process_oulu_3ddfa.py --dry-run
+```
+
+### Process MSU-MFSD
+```bash
+cd <YOUR_WORKSPACE_PATH>
+conda activate Project
+
+# Run the full pipeline
+python process_msu_3ddfa.py --split all --frames-per-video 25
+```
+
+### Advanced Arguments
+- `--workers <int>`: Number of parallel threads. Default is 4. Increase this depending on your CPU/GPU capabilities.
+- `--frames-per-video <int>`: The target number of frames to extract from each video. Default is 25.
+
+---
+
+## 4. Output Format
+
+The output RGB images and 1-channel Depth Maps (resized to 256x256, strictly cropped around the face bounding box) will be generated at:
+- OULU: `<YOUR_WORKSPACE_PATH>\OULU_NPU\processed_3ddfa\...`
+- MSU: `<YOUR_WORKSPACE_PATH>\MSU-MFSD\processed_3ddfa\...`
+
+Inside the output folder, files are automatically sorted into standard subdirectories (`real`, `attack`, `print1`, `replay1`, etc.). 
+
+The naming convention uses exactly 4-digit indices tracking the successful extractions:
+- `frame_0000.jpg` (RGB)
+- `frame_0000_depth.jpg` (Depth Map)
+- `frame_0001.jpg`
+- `frame_0001_depth.jpg`
+- ... up to `frame_0024.jpg` (for 25 frames).

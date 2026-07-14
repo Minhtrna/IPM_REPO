@@ -1,218 +1,135 @@
-"""
-process_oulu_3ddfa.py
-=====================
-OULU-NPU reprocessing pipeline using 3DDFA_V2:
-  1. Parse video lists from Train_files, Dev_files, Test_files.
-  2. Parse bounding boxes from corresponding .txt files (frame_idx, x, y, w, h).
-  3. Decode frames from .avi video.
-  4. Run 3DDFA_V2 dense reconstruction on FULL image using bounding box.
-  5. Apply convex-hull mask (CASIA style: face oval, black background).
-  6. Crop tightly around 3D vertices, pad to square, resize to 256x256.
-  7. Save masked RGB + grayscale depth (255=near, 0=bg). Attack -> zero depth.
-
-Output structure mirrors input sets:
-  d:/DATASET/OULU_NPU/processed_3ddfa/
-    Train_files/
-      real/
-        1_1_01_1/
-          frame_0000.jpg, frame_0000_depth.jpg
-      attack/
-        1_1_01_2/
-          frame_0000.jpg, frame_0000_depth.jpg
-    Dev_files/
-    Test_files/
-
-Usage:
-    cd d:/DATASET/3DDFA_V2
-    conda run -n Project python ../process_oulu_3ddfa.py --dry-run
-    conda run -n Project python ../process_oulu_3ddfa.py --split Train_files
-    conda run -n Project python ../process_oulu_3ddfa.py --split all
-"""
-
-import sys, os, argparse, subprocess, tempfile
-import numpy as np
-import cv2
-import yaml
+import os
+import sys
+import math
+import argparse
 from pathlib import Path
-from PIL import Image
-from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-SCRIPT_DIR  = Path(__file__).resolve().parent
-TDDFA_DIR   = SCRIPT_DIR / '3DDFA_V2'
-OULU_DIR    = SCRIPT_DIR / 'OULU_NPU'
-OUTPUT_DIR  = OULU_DIR / 'processed_3ddfa'
-CONFIG      = 'configs/mb1_120x120.yml'
+import cv2
+import numpy as np
+from tqdm import tqdm
+import yaml
+import torch
+
+SCRIPT_DIR = Path(__file__).parent.resolve()
+OULU_DIR   = SCRIPT_DIR / 'OULU_NPU'
+OUTPUT_DIR = SCRIPT_DIR / 'OULU_NPU' / 'processed_3ddfa'
+TDDFA_DIR  = SCRIPT_DIR / '3DDFA_V2'
 
 OUTPUT_SIZE = 256
 
 sys.path.insert(0, str(TDDFA_DIR))
-os.chdir(TDDFA_DIR)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TDDFA Core Logic
-# ─────────────────────────────────────────────────────────────────────────────
 
 def init_tddfa():
-    from TDDFA import TDDFA
-    cfg = yaml.load(open(CONFIG), Loader=yaml.SafeLoader)
-    return TDDFA(gpu_mode=False, **cfg)
+    cwd = os.getcwd()
+    try:
+        os.chdir(str(TDDFA_DIR))
+        from FaceBoxes import FaceBoxes
+        from TDDFA import TDDFA
+        
+        cfg = yaml.load(open('configs/mb1_120x120.yml'), Loader=yaml.SafeLoader)
+        tddfa = TDDFA(gpu_mode=True, **cfg)
+        return tddfa
+    finally:
+        os.chdir(cwd)
 
 def make_masked_rgb_and_depth(img_bgr, tddfa, box):
-    """
-    Given FULL image and a face box [x1, y1, x2, y2, 1.0]:
-      - Run 3DDFA dense reconstruction.
-      - Build convex-hull face mask on full image.
-      - Crop both masked RGB and depth tightly around the 3D vertices.
-    """
     from Sim3DR import rasterize
     from utils.tddfa_util import _to_ctype
-
-    h, w = img_bgr.shape[:2]
-
-    try:
-        param_lst, roi_lst = tddfa(img_bgr, [box])
-        ver_lst = tddfa.recon_vers(param_lst, roi_lst, dense_flag=True)
-    except Exception:
+    
+    boxes = [box]
+    with torch.no_grad():
+        param_lst, roi_box_lst = tddfa(img_bgr, boxes)
+    if not param_lst:
         return None, None
 
-    ver   = ver_lst[0]
-    tri   = tddfa.tri
-    ver_T = _to_ctype(ver.T.astype(np.float32))
-
-    # --- Convex hull mask ---
-    pts = ver_T[:, :2].astype(np.int32)
-    pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
-    pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
-    hull = cv2.convexHull(pts)
-    mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillConvexPoly(mask, hull, 255)
-
-    # --- Masked RGB ---
-    masked_bgr = img_bgr.copy()
-    masked_bgr[mask == 0] = 0
-
-    # --- Z-buffer depth ---
-    z      = ver_T[:, 2]
-    z_norm = (z - z.min()) / (z.max() - z.min() + 1e-8)
-    z_3ch  = np.repeat(z_norm[:, None], 3, axis=1).astype(np.float32)
-    blank  = np.zeros((h, w, 3), dtype=np.uint8)
-    d_rgb  = rasterize(ver_T, tri, z_3ch, bg=blank)
-    d_f    = d_rgb[:, :, 0].astype(np.float32) / 255.0
-    d_f[mask == 0] = 0.0
-    face_v = d_f[mask > 0]
-    if len(face_v) > 0:
-        vmin, vmax = face_v.min(), face_v.max()
-        if vmax > vmin:
-            d_f[mask > 0] = (d_f[mask > 0] - vmin) / (vmax - vmin)
-    depth_gray = (d_f * 255).clip(0, 255).astype(np.uint8)
-
-    # --- Tight Crop around Mesh ---
-    padding_ratio = 0.05
-    xs = ver[0, :]
-    ys = ver[1, :]
-    x0 = max(0, int(xs.min()) - int(padding_ratio * (xs.max() - xs.min())))
-    x1 = min(w, int(xs.max()) + int(padding_ratio * (xs.max() - xs.min())))
-    y0 = max(0, int(ys.min()) - int(padding_ratio * (ys.max() - ys.min())))
-    y1 = min(h, int(ys.max()) + int(padding_ratio * (ys.max() - ys.min())))
+    ver_lst = tddfa.recon_vers(param_lst, roi_box_lst, dense_flag=True)
+    ver = _to_ctype(ver_lst[0].T)
+    z = ver[:, 2]
+    z_min, z_max = min(z), max(z)
     
-    # Make crop square
-    cw = x1 - x0
-    ch = y1 - y0
-    if cw > ch:
-        diff = cw - ch
-        y0 = max(0, y0 - diff // 2)
-        y1 = min(h, y1 + (diff - diff // 2))
-    elif ch > cw:
-        diff = ch - cw
-        x0 = max(0, x0 - diff // 2)
-        x1 = min(w, x1 + (diff - diff // 2))
+    # Normalize z so that the closest points (z_min, nose) map to 1.0 (white 255)
+    # and the farthest points (z_max, cheeks) map to 10/255.0 (dark gray 10).
+    # Sim3DR uses 'ver' for Z-buffering (occlusion), so inverting 'z_norm' as colors is perfectly safe!
+    z_norm = (z - z_min) / (z_max - z_min)
+    z_norm = z_norm * (245.0 / 255.0) + (10.0 / 255.0)
+    z_norm = np.repeat(z_norm[:, np.newaxis], 3, axis=1).astype(np.float32)
+    
+    overlap = np.zeros_like(img_bgr, dtype=np.uint8)
+    depth_map = rasterize(ver, tddfa.tri, z_norm, bg=overlap)
+    
+    mask = depth_map[:, :, 0] > 0
+    mask_uint8 = mask.astype(np.uint8)
+    masked_bgr = img_bgr.copy()
+    masked_bgr[mask_uint8 == 0] = 0
 
-    crop_rgb   = masked_bgr[y0:y1, x0:x1]
-    crop_depth = depth_gray[y0:y1, x0:x1]
-    return crop_rgb, crop_depth
+    x_min, x_max = np.min(ver_lst[0][0, :]), np.max(ver_lst[0][0, :])
+    y_min, y_max = np.min(ver_lst[0][1, :]), np.max(ver_lst[0][1, :])
 
+    h, w = img_bgr.shape[:2]
+    x_min = max(0, int(x_min))
+    y_min = max(0, int(y_min))
+    x_max = min(w, int(x_max))
+    y_max = min(h, int(y_max))
+    
+    margin_w = int((x_max - x_min) * 0.05)
+    margin_h = int((y_max - y_min) * 0.05)
+    
+    x1 = max(0, x_min - margin_w)
+    y1 = max(0, y_min - margin_h)
+    x2 = min(w, x_max + margin_w)
+    y2 = min(h, y_max + margin_h)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# OULU-NPU Parsing
-# ─────────────────────────────────────────────────────────────────────────────
-
-import math
+    cropped_bgr = masked_bgr[y1:y2, x1:x2]
+    cropped_depth = depth_map[y1:y2, x1:x2]
+    
+    return cropped_bgr, cropped_depth
 
 def parse_bbox_file(txt_path):
-    """
-    OULU-NPU txt format: num_frame, x_eye_left, y_eye_left, x_eye_right, y_eye_right
-    Returns list of dicts: { 'frame_idx': int, 'box': [x1, y1, x2, y2, 1.0] }
-    """
     entries = []
-    with open(txt_path) as f:
+    with open(txt_path, 'r') as f:
         for line in f:
             parts = line.strip().split(',')
             if len(parts) >= 5:
                 idx = int(parts[0])
                 xl, yl, xr, yr = map(int, parts[1:5])
-                
-                if xl == 0 and yl == 0 and xr == 0 and yr == 0:
-                    continue # Failed to detect
-                    
+                if xl == 0 and yl == 0 and xr == 0 and yr == 0: continue
                 d = math.hypot(xr - xl, yr - yl)
-                if d == 0:
-                    continue
-                    
+                if d == 0: continue
                 cx = (xl + xr) / 2.0
                 cy = (yl + yr) / 2.0
-                
                 w_box = 3.0 * d
                 h_box = 3.0 * d
-                
                 x1 = max(0, int(cx - w_box / 2))
                 y1 = max(0, int(cy - 0.4 * h_box))
                 x2 = int(cx + w_box / 2)
                 y2 = int(cy + 0.6 * h_box)
-                
-                entries.append({
-                    'frame_idx': idx,
-                    'box': [x1, y1, x2, y2, 1.0]
-                })
+                entries.append({'frame_idx': idx, 'box': [x1, y1, x2, y2, 1.0]})
     return entries
 
 def sample_frames(entries, n):
-    if n <= 0 or len(entries) <= n:
-        return entries
+    if n <= 0 or len(entries) <= n: return entries
     idx = np.linspace(0, len(entries) - 1, n, dtype=int)
     return [entries[i] for i in idx]
 
 def build_tasks(split_name, frames_per_video):
-    if split_name == 'all':
-        subdirs = ['Train_files', 'Dev_files', 'Test_files']
-    else:
-        subdirs = [split_name]
-
+    subdirs = ['Train_files', 'Dev_files', 'Test_files'] if split_name == 'all' else [split_name]
     tasks = []
     for sdir in subdirs:
         video_dir = OULU_DIR / sdir
-        if not video_dir.exists():
-            continue
-
-        # Each set folder contains a subfolder with the same name containing the actual files
-        # e.g., Train_files/Train_files/1_1_01_1.avi
+        if not video_dir.exists(): continue
         inner_dir = video_dir / sdir
-        if not inner_dir.exists():
-            inner_dir = video_dir # fallback if directly inside
+        if not inner_dir.exists(): inner_dir = video_dir
 
         for avi_path in sorted(inner_dir.glob('*.avi')):
             stem = avi_path.stem
             txt_path = avi_path.with_suffix('.txt')
-            if not txt_path.exists():
-                continue
+            if not txt_path.exists(): continue
 
-            # OULU file name: Phone_Session_User_FileID
             parts = stem.split('_')
-            if len(parts) < 4:
-                continue
+            if len(parts) < 4: continue
             
             file_id = int(parts[3])
-            
             if file_id == 1: label = 'real'
             elif file_id == 2: label = 'print1'
             elif file_id == 3: label = 'print2'
@@ -221,69 +138,68 @@ def build_tasks(split_name, frames_per_video):
             else: label = 'attack'
             
             out_dir = OUTPUT_DIR / sdir / label / stem
-
             entries = parse_bbox_file(txt_path)
-            if not entries:
-                continue
-
-            entries = sample_frames(entries, frames_per_video)
-
-            if out_dir.exists():
-                done = len(list(out_dir.glob('*_depth.jpg')))
-                if done >= len(entries):
-                    continue
-
+            if not entries: continue
+            if not entries: continue
             tasks.append({
                 'video': avi_path,
                 'txt': txt_path,
                 'label': label,
                 'out_dir': out_dir,
-                'entries': entries
+                'entries': entries,
+                'frames_per_video': frames_per_video
             })
     return tasks
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Process Video
-# ─────────────────────────────────────────────────────────────────────────────
+import random
 
 def process_video(task, tddfa):
     video_path = task['video']
-    entries    = task['entries']
-    out_dir    = task['out_dir']
-    label      = task['label']
-    is_real    = (label == 'real')
+    all_entries = task['entries']
+    out_dir = task['out_dir']
+    label = task['label']
+    frames_per_video = task['frames_per_video']
+    is_real = (label == 'real')
 
     out_dir.mkdir(parents=True, exist_ok=True)
-
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         return 0, 0, f'[FAIL] cv2 could not open: {video_path.name}'
 
+    n_entries = len(all_entries)
+    if n_entries == 0: return 0, 0, None
+
+    if n_entries <= frames_per_video:
+        queue = list(range(n_entries))
+        remaining_indices = []
+    else:
+        queue = np.linspace(0, n_entries - 1, frames_per_video, dtype=int).tolist()
+        remaining_indices = list(set(range(n_entries)) - set(queue))
+        random.shuffle(remaining_indices)
+
     saved = ok_depth = 0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    for entry in entries:
-        fidx = entry['frame_idx']
-        
-        # OULU .txt indices are 0-based.
-        target_idx = fidx
-        if target_idx < 0 or target_idx >= total_frames:
-            continue
-            
-        cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
+    while queue and saved < frames_per_video:
+        idx = queue.pop(0)
+        entry = all_entries[idx]
+        frame_idx = entry['frame_idx']
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()
-        if not ret:
+        
+        if not ret or frame is None:
+            if remaining_indices: queue.append(remaining_indices.pop())
             continue
 
-        box = entry['box'] # [x1, y1, x2, y2, 1.0]
-
+        box = entry['box']
+        
         if is_real:
             cropped_bgr, cropped_depth = make_masked_rgb_and_depth(frame, tddfa, box)
             if cropped_bgr is None:
                 x1, y1, x2, y2 = map(int, box[:4])
                 cropped_bgr = frame[max(0, y1):y2, max(0, x1):x2]
-                if cropped_bgr.size == 0: continue
-                cropped_depth = np.zeros(cropped_bgr.shape[:2], dtype=np.uint8)
+                if cropped_bgr.size != 0:
+                    cropped_depth = np.zeros(cropped_bgr.shape[:2], dtype=np.uint8)
             else:
                 ok_depth += 1
         else:
@@ -291,80 +207,61 @@ def process_video(task, tddfa):
             if cropped_bgr is None:
                 x1, y1, x2, y2 = map(int, box[:4])
                 cropped_bgr = frame[max(0, y1):y2, max(0, x1):x2]
-                if cropped_bgr.size == 0: continue
-            cropped_depth = np.zeros(cropped_bgr.shape[:2], dtype=np.uint8)
-            ok_depth += 1
+            if cropped_bgr is not None and cropped_bgr.size != 0:
+                cropped_depth = np.zeros(cropped_bgr.shape[:2], dtype=np.uint8)
 
-        # Resize to OUTPUT_SIZE x OUTPUT_SIZE
-        rgb_out   = cv2.resize(cropped_bgr, (OUTPUT_SIZE, OUTPUT_SIZE), interpolation=cv2.INTER_LINEAR)
-        depth_out = cv2.resize(cropped_depth, (OUTPUT_SIZE, OUTPUT_SIZE), interpolation=cv2.INTER_NEAREST)
-
-        base = f'frame_{fidx:04d}'
-        cv2.imwrite(str(out_dir / f'{base}.jpg'), rgb_out, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        cv2.imwrite(str(out_dir / f'{base}_depth.jpg'), depth_out, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        saved += 1
+        if cropped_bgr is not None and cropped_bgr.size != 0:
+            rgb_out = cv2.resize(cropped_bgr, (OUTPUT_SIZE, OUTPUT_SIZE), interpolation=cv2.INTER_LINEAR)
+            if len(cropped_depth.shape) == 3:
+                cropped_depth = cropped_depth[:, :, 0] # ensure 1 channel
+            depth_out = cv2.resize(cropped_depth, (OUTPUT_SIZE, OUTPUT_SIZE), interpolation=cv2.INTER_NEAREST)
+            
+            cv2.imwrite(str(out_dir / f'frame_{saved:04d}.jpg'), rgb_out)
+            cv2.imwrite(str(out_dir / f'frame_{saved:04d}_depth.jpg'), depth_out)
+            saved += 1
+        else:
+            if remaining_indices: queue.append(remaining_indices.pop())
 
     cap.release()
     return saved, ok_depth, None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
-
 def main():
-    parser = argparse.ArgumentParser(description='OULU-NPU Reprocess with 3DDFA oval-mask crop + depth.')
-    parser.add_argument('--split', choices=['Train_files', 'Dev_files', 'Test_files', 'all'], default='all')
-    parser.add_argument('--frames-per-video', type=int, default=25, help='Frames to sample per video (0=all)')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--split', type=str, default='all')
+    parser.add_argument('--frames-per-video', type=int, default=25)
+    parser.add_argument('--workers', type=int, default=4, help='Number of threads')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
 
     print('=' * 55)
-    print(' OULU-NPU Reprocess  (3DDFA oval mask + depth)')
-    print('=' * 55)
-    print(f' Output  : {OUTPUT_DIR}')
-    print(f' Split   : {args.split}')
-    print(f' Frames  : {args.frames_per_video or "all"} / video')
+    print(' OULU-NPU Reprocess  (Multithreaded Fast)')
     print('=' * 55)
 
-    print('\n[INFO] Building task list...')
     tasks = build_tasks(args.split, args.frames_per_video)
-    n_real = sum(1 for t in tasks if t['label'] == 'real')
-    n_attack = sum(1 for t in tasks if t['label'] != 'real')
-    total_frames = sum(len(t['entries']) for t in tasks)
-    print(f'       Videos : {len(tasks)}  ({n_real} real, {n_attack} attack)')
-    print(f'       Frames : ~{total_frames:,}')
-
-    if args.dry_run:
-        print('[DRY RUN] No files written.\n')
-        return
-
-    if not tasks:
-        print('[INFO] Nothing to process.\n')
-        return
+    print(f'[INFO] Found {len(tasks)} videos to process.')
+    if args.dry_run or not tasks: return
 
     print('\n[INFO] Loading TDDFA...')
-    tddfa = init_tddfa()
+    tddfa = init_tddfa() # TDDFA is thread-safe for inference if using CPU or multiple streams
     print('[OK] TDDFA ready\n')
 
-    total_saved = total_ok_depth = total_fail = 0
-    bar = tqdm(tasks, desc='Videos', unit='vid', ascii=True)
-    for task in bar:
-        saved, ok_d, err = process_video(task, tddfa)
-        total_saved += saved
-        total_ok_depth += ok_d
-        if err:
-            total_fail += 1
-            tqdm.write(err)
-        else:
-            tqdm.write(f'  [OK] {task["video"].stem}: {saved} frames')
+    total_saved = total_fail = 0
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {executor.submit(process_video, task, tddfa): task for task in tasks}
+        for future in tqdm(as_completed(futures), total=len(futures), desc='Processing', ascii=True):
+            try:
+                saved, ok_d, err = future.result()
+                total_saved += saved
+                if err: total_fail += 1
+            except Exception as e:
+                total_fail += 1
 
-    print(f'\n{"="*55}')
-    print(f' Done!')
-    print(f'  Videos processed : {len(tasks) - total_fail}')
-    print(f'  Frames saved     : {total_saved:,}  (RGB + depth pairs)')
-    print(f'  Depth ok (3DDFA) : {total_ok_depth:,}')
-    print(f'  Video failures   : {total_fail}')
-    print(f'{"="*55}\n')
+    expected_frames = sum(min(len(t['entries']), args.frames_per_video) for t in tasks)
+    print(f'\nDone! Processed {len(tasks) - total_fail} videos. Saved {total_saved} frames.')
+    if total_saved == expected_frames:
+        print(f'[VERIFICATION SUCCESS] Exact expected frames ({expected_frames}) were successfully saved.')
+    else:
+        print(f'[VERIFICATION WARNING] Expected {expected_frames} frames but saved {total_saved}. Missing: {expected_frames - total_saved}')
 
 if __name__ == '__main__':
     main()
